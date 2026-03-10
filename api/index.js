@@ -71,15 +71,42 @@ app.post("/api/deploy", upload.single("zipFile"), async (req, res) => {
     const owner = user.login;
     send("progress", { step: 1, message: `✅ Login sebagai: ${owner}` });
 
-    // Step 2: Create repository
+    // Step 2: Create repository dengan auto_init: true
+    // WAJIB auto_init:true agar git database ter-inisialisasi.
+    // Tanpa ini, blob API akan error "Git Repository is empty".
     send("progress", { step: 2, message: `📁 Membuat repository: ${repo}...` });
-    await gh("/user/repos", "POST", token, {
+    const newRepo = await gh("/user/repos", "POST", token, {
       name: repo,
       description: description || "",
       private: isPrivate === "true",
-      auto_init: false,
+      auto_init: true,           // ← kunci utama fix
+      default_branch: branch,
     });
     send("progress", { step: 2, message: `✅ Repository "${repo}" berhasil dibuat!` });
+
+    // Tunggu sebentar agar GitHub selesai inisialisasi git database
+    await sleep(1500);
+
+    // Ambil SHA commit awal (dari README otomatis yang dibuat auto_init)
+    // Ini diperlukan sebagai parent commit kita nanti
+    send("progress", { step: 2, message: `🔍 Mengambil info branch awal...` });
+
+    // Coba ambil branch yang diminta, fallback ke default branch repo
+    let initCommitSha;
+    let actualBranch = branch;
+
+    try {
+      const refData = await gh(`/repos/${owner}/${repo}/git/ref/heads/${branch}`, "GET", token);
+      initCommitSha = refData.object.sha;
+    } catch {
+      // Branch belum ada (GitHub mungkin pakai 'main' atau 'master')
+      const repoInfo = await gh(`/repos/${owner}/${repo}`, "GET", token);
+      actualBranch = repoInfo.default_branch;
+      const refData = await gh(`/repos/${owner}/${repo}/git/ref/heads/${actualBranch}`, "GET", token);
+      initCommitSha = refData.object.sha;
+    }
+
+    send("progress", { step: 2, message: `✅ Branch "${actualBranch}" siap (SHA: ${initCommitSha.slice(0, 7)})` });
 
     // Step 3: Extract ZIP
     send("progress", { step: 3, message: "📦 Mengekstrak file ZIP..." });
@@ -95,7 +122,7 @@ app.post("/api/deploy", upload.single("zipFile"), async (req, res) => {
     if (entries.length === 0)
       return send("error", { message: "ZIP tidak mengandung file apapun." });
 
-    // Strip common root folder
+    // Strip common root folder (misal: "project-main/" → "")
     const allPaths = entries.map(e => e.entryName);
     const roots = [...new Set(allPaths.map(p => p.split("/")[0]))];
     const stripPrefix =
@@ -113,10 +140,10 @@ app.post("/api/deploy", upload.single("zipFile"), async (req, res) => {
       message: `✅ Ditemukan ${files.length} file${stripPrefix ? ` (strip prefix: "${roots[0]}/")` : ""}`,
     });
 
-    // Step 4: Create Git blobs in parallel batches
+    // Step 4: Buat blobs secara paralel per batch
     send("progress", {
       step: 4,
-      message: `🔄 Membuat blob untuk ${files.length} file... (ini mungkin butuh beberapa detik)`,
+      message: `🔄 Membuat blob untuk ${files.length} file...`,
       total: files.length,
     });
 
@@ -167,7 +194,7 @@ app.post("/api/deploy", upload.single("zipFile"), async (req, res) => {
     if (blobResults.length === 0)
       return send("error", { message: "Semua file gagal diproses. Cek koneksi atau izin token." });
 
-    // Step 5: Create Git tree (all files in ONE tree)
+    // Step 5: Buat satu Git tree dari semua blob
     send("progress", { step: 4, message: `🌳 Membuat Git tree untuk ${blobResults.length} file...` });
 
     const treeItems = blobResults.map(b => ({
@@ -179,36 +206,38 @@ app.post("/api/deploy", upload.single("zipFile"), async (req, res) => {
 
     const tree = await gh(`/repos/${owner}/${repo}/git/trees`, "POST", token, {
       tree: treeItems,
+      // Tidak pakai base_tree agar README bawaan auto_init diganti bersih
     });
 
     send("progress", { step: 4, message: "✅ Git tree berhasil!" });
 
-    // Step 6: Create single commit
+    // Step 6: Buat satu commit dengan parent = commit awal dari auto_init
     send("progress", { step: 4, message: "💾 Membuat commit..." });
 
     const commit = await gh(`/repos/${owner}/${repo}/git/commits`, "POST", token, {
       message: `🚀 Initial commit — ${blobResults.length} file via GitDeploy`,
       tree: tree.sha,
-      parents: [],
+      parents: [initCommitSha],   // ← pakai SHA commit awal sebagai parent
     });
 
     send("progress", { step: 4, message: "✅ Commit berhasil!" });
 
-    // Step 7: Create branch ref
-    send("progress", { step: 4, message: `🌿 Push ke branch "${branch}"...` });
+    // Step 7: Update ref branch yang sudah ada (PATCH, bukan POST)
+    // Branch sudah ada karena auto_init, jadi harus di-update bukan di-create
+    send("progress", { step: 4, message: `🌿 Update branch "${actualBranch}"...` });
 
-    await gh(`/repos/${owner}/${repo}/git/refs`, "POST", token, {
-      ref: `refs/heads/${branch}`,
+    await gh(`/repos/${owner}/${repo}/git/refs/heads/${actualBranch}`, "PATCH", token, {
       sha: commit.sha,
+      force: true,               // ← force update agar ref pindah ke commit kita
     });
 
-    send("progress", { step: 4, message: `✅ Branch "${branch}" siap!` });
+    send("progress", { step: 4, message: `✅ Branch "${actualBranch}" berhasil diupdate!` });
 
     // Done
     const repoUrl = `https://github.com/${owner}/${repo}`;
     const summary = blobFailed.length > 0
       ? `🎉 Selesai! ${blobResults.length} file berhasil. ${blobFailed.length} file dilewati (lihat log).`
-      : `🎉 Selesai! Semua ${blobResults.length} file berhasil diupload dalam 1 commit!`;
+      : `🎉 Selesai! Semua ${blobResults.length} file berhasil diupload ke branch "${actualBranch}"!`;
 
     send("done", {
       message: summary,
